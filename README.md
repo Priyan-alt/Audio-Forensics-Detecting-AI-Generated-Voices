@@ -174,17 +174,3 @@ AI: 96.8%
 - Multi-Language Support
 
 ---
-
-## Author
-
-Priyan
-
-B.Tech ECM
-
-VIT Chennai
-
----
-
-## License
-
-This project is developed for educational and research purposes.
