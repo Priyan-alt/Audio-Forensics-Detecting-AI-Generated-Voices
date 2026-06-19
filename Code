@@ -1,0 +1,274 @@
+import os
+import librosa
+import numpy as np
+from sklearn.model_selection import cross_val_score, LeaveOneOut, StratifiedKFold
+from sklearn.ensemble import GradientBoostingClassifier, VotingClassifier
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report
+import pickle
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# ─────────────────────────────────────────────
+# 1. FEATURE EXTRACTION
+# ─────────────────────────────────────────────
+def extract_features(audio, sr):
+    """Extract rich acoustic features from a raw audio array."""
+
+    # MFCC + deltas
+    mfcc        = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
+    mfcc_delta  = librosa.feature.delta(mfcc)
+    mfcc_delta2 = librosa.feature.delta(mfcc, order=2)
+
+    # Spectral
+    zcr            = librosa.feature.zero_crossing_rate(audio)[0]
+    spec_centroid  = librosa.feature.spectral_centroid(y=audio, sr=sr)[0]
+    spec_rolloff   = librosa.feature.spectral_rolloff(y=audio, sr=sr)[0]
+    spec_bandwidth = librosa.feature.spectral_bandwidth(y=audio, sr=sr)[0]
+    spec_flatness  = librosa.feature.spectral_flatness(y=audio)[0]
+
+    # Chroma + Tonnetz
+    chroma   = librosa.feature.chroma_stft(y=audio, sr=sr)
+    harmonic = librosa.effects.harmonic(audio)
+    tonnetz  = librosa.feature.tonnetz(y=harmonic, sr=sr)
+
+    # Energy + Mel
+    rms     = librosa.feature.rms(y=audio)[0]
+    mel_db  = librosa.power_to_db(
+                librosa.feature.melspectrogram(y=audio, sr=sr, n_mels=128))
+
+    def stats(feat):
+        return np.concatenate([np.mean(feat, axis=1), np.std(feat, axis=1)])
+
+    def scalar_stats(arr):
+        return np.array([np.mean(arr), np.std(arr)])
+
+    return np.concatenate([
+        stats(mfcc), stats(mfcc_delta), stats(mfcc_delta2),
+        scalar_stats(zcr),
+        scalar_stats(spec_centroid), scalar_stats(spec_rolloff),
+        scalar_stats(spec_bandwidth), scalar_stats(spec_flatness),
+        stats(chroma), stats(tonnetz),
+        scalar_stats(rms), scalar_stats(mel_db),
+    ])
+
+
+# ─────────────────────────────────────────────
+# 2. DATA AUGMENTATION  (10 samples → 70)
+# ─────────────────────────────────────────────
+def augment_audio(audio, sr):
+    """
+    Generate 6 augmented copies of one audio clip.
+    10 original samples x 7 (original + 6 aug) = 70 samples.
+    """
+    augmented = [audio]   # keep original too
+
+    # Pitch shifts
+    augmented.append(librosa.effects.pitch_shift(audio, sr=sr, n_steps=2))
+    augmented.append(librosa.effects.pitch_shift(audio, sr=sr, n_steps=-2))
+
+    # Time stretches
+    augmented.append(librosa.effects.time_stretch(audio, rate=1.15))
+    augmented.append(librosa.effects.time_stretch(audio, rate=0.85))
+
+    # Gaussian noise
+    noise = np.random.normal(0, 0.004, len(audio))
+    augmented.append(audio + noise)
+
+    # Volume scaling
+    augmented.append(audio * 1.25)
+
+    return augmented
+
+
+# ─────────────────────────────────────────────
+# 3. LOAD DATASET  (with augmentation)
+# ─────────────────────────────────────────────
+def load_dataset(dataset_path="dataset", augment=True):
+    X, y = [], []
+    classes = {"human": 0, "ai": 1}
+
+    human_target = 50   # we want ~50 human samples after augmentation
+
+    for label_name, label_idx in classes.items():
+        folder_path = os.path.join(dataset_path, label_name)
+
+        if not os.path.isdir(folder_path):
+            raise FileNotFoundError(f"Folder not found: {folder_path}")
+
+        wav_files = [f for f in os.listdir(folder_path) if f.endswith(".wav")]
+
+        print(f"\nProcessing {label_name.upper()}...")
+
+        #  CASE 1: HUMAN → AUGMENT
+        if label_name == "human":
+            for file in wav_files:
+                file_path = os.path.join(folder_path, file)
+
+                try:
+                    audio, sr = librosa.load(file_path, sr=16000, mono=True)
+
+                    copies = augment_audio(audio, sr)
+
+                    for copy in copies:
+                        X.append(extract_features(copy, sr))
+                        y.append(label_idx)
+
+                        # stop when we reach ~50
+                        if y.count(0) >= human_target:
+                            break
+
+                    if y.count(0) >= human_target:
+                        break
+
+                except Exception as e:
+                    print(f"Skipping {file}: {e}")
+
+        #  CASE 2: AI → NO AUGMENTATION
+        else:
+            for file in wav_files:
+                file_path = os.path.join(folder_path, file)
+
+                try:
+                    audio, sr = librosa.load(file_path, sr=16000, mono=True)
+
+                    # only original (no augmentation)
+                    X.append(extract_features(audio, sr))
+                    y.append(label_idx)
+
+                except Exception as e:
+                    print(f"Skipping {file}: {e}")
+
+    X = np.array(X)
+    y = np.array(y)
+
+    print("\nFinal Dataset Summary")
+    print(f"Human: {np.sum(y==0)} | AI: {np.sum(y==1)}")
+    print(f"Total samples: {len(X)}")
+
+    return X, y
+
+
+# ─────────────────────────────────────────────
+# 4. BUILD MODEL  (Ensemble: GBM + SVM)
+# ─────────────────────────────────────────────
+def build_model():
+    gbm = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=3,
+        subsample=0.8,
+        min_samples_split=4,
+        random_state=42
+    )
+
+    svm = SVC(
+        kernel="rbf",
+        C=5.0,
+        gamma="scale",
+        class_weight="balanced",
+        probability=True,
+        random_state=42
+    )
+
+    ensemble = VotingClassifier(
+        estimators=[("gbm", gbm), ("svm", svm)],
+        voting="soft"
+    )
+
+    pipeline = Pipeline([
+        ("scaler", StandardScaler()),
+        ("model", ensemble)
+    ])
+
+    return pipeline
+
+
+# ─────────────────────────────────────────────
+# 5. TRAIN & EVALUATE
+# ─────────────────────────────────────────────
+def train_and_evaluate(X, y):
+    pipeline = build_model()
+
+    n = len(X)
+    if n <= 30:
+        cv      = LeaveOneOut()
+        cv_name = "Leave-One-Out"
+    else:
+        cv      = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        cv_name = "Stratified 5-Fold"
+
+    print(f"\n  Running {cv_name} cross-validation...")
+    scores = cross_val_score(pipeline, X, y, cv=cv, scoring="accuracy")
+
+    acc = scores.mean()
+    print(f"\n  CV Strategy  : {cv_name}")
+    print(f"  Accuracy     : {acc:.2%}  (+/-{scores.std():.2%})")
+    print(f"  Correct      : {int(round(acc * len(scores)))}/{len(scores)}")
+
+    if acc >= 0.95:
+        print("  Result       : Excellent - model is reliable!")
+    elif acc >= 0.80:
+        print("  Result       : Good - add more real samples to push higher")
+    else:
+        print("  Result       : Low - collect 20+ real samples per class")
+
+    return pipeline
+
+
+# ─────────────────────────────────────────────
+# 6. CLASSIFY A SINGLE FILE
+# ─────────────────────────────────────────────
+def classify_file(file_path, pipeline):
+    try:
+        audio, sr = librosa.load(file_path, sr=16000, mono=True)
+    except Exception as e:
+        print(f"  Could not load {file_path}: {e}")
+        return
+
+    features   = extract_features(audio, sr).reshape(1, -1)
+    prediction = pipeline.predict(features)[0]
+    proba      = pipeline.predict_proba(features)[0]
+    confidence = max(proba) * 100
+
+    label = "Human Voice"       if prediction == 0 else "AI Generated Voice"
+    icon  = "Human"             if prediction == 0 else "AI"
+
+    print(f"\n{'='*50}")
+    print(f"  File          : {os.path.basename(file_path)}")
+    print(f"  [{icon}] Result : {label}")
+    print(f"  Confidence    : {confidence:.1f}%")
+    print(f"  Human {proba[0]*100:.1f}%  |  AI {proba[1]*100:.1f}%")
+    print(f"{'='*50}\n")
+
+
+# ─────────────────────────────────────────────
+# 7. MAIN
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+
+    print("\n Loading & augmenting dataset...")
+    X, y = load_dataset("dataset", augment=True)
+
+    if len(X) == 0:
+        raise SystemExit("No audio files found. Check your dataset folder.")
+
+    pipeline = train_and_evaluate(X, y)
+
+    print("\n  Training final model on all data...")
+    pipeline.fit(X, y)
+
+    with open("voice_detector_model.pkl", "wb") as f:
+        pickle.dump(pipeline, f)
+    print("  Model saved -> voice_detector_model.pkl")
+
+    test_file = "test.wav"
+    if os.path.exists(test_file):
+        classify_file(test_file, pipeline)
+    else:
+        print(f"\n  '{test_file}' not found - skipping test classification.")
+
+    print("Done!\n")
